@@ -6455,6 +6455,52 @@ window.tfCloudLoad2029=tfCloudLoad2029;window.tfCloudMode2029=tfCloudMode2029;wi
     const files=(window.divonicoVault?.files||[]); const rows=files.map(f=>{const old=byLocal.get(String(f.id||''));return {id:old?.id||crypto.randomUUID(),user_id:uid(),client_id:null,os_id:null,name:f.name||'arquivo',storage_bucket:null,storage_path:null,mime_type:f.type||null,size_bytes:Number(f.size||0)||null,metadata:{local_id:f.id,folderId:f.folderId,storage:f.storage||null,createdAt:f.createdAt||null,cloudBinary:'pendente'},created_at:old?.created_at||f.createdAt||now(),updated_at:now()};});
     if(rows.length){const {error}=await client().from('tf_files').upsert(rows,{onConflict:'id'});if(error)throw error;}log('📁 Arquivos: '+rows.length+' metadados sincronizados');return rows.length;
   }
+  async function syncTFXOnly(log){
+    if(!client()||!uid())throw Error('Sessão Supabase não disponível.');
+    const results={clients:0,os:0,accesses:0,messages:0,verified:false,conflicts:0};
+    // TFX-only: não chama Divônico, TFOS, vault ou estado do emulador.
+    results.clients=await syncClients(log);
+    results.os=await syncOS(log);
+    results.accesses=await syncAccesses(log);
+    results.messages=await syncMessages(log);
+
+    // Segunda leitura: confirma que o que acabou de ser enviado existe na nuvem
+    // com os mesmos dados essenciais. Não altera o TFOS e não apaga registros.
+    const [cc,oo,aa,mm]=await Promise.all([
+      getAll('tf_clients','id,legacy_id,name,document,phone,email,address,number,complement,neighborhood,city,state,zip_code,status,notes,data,created_at,updated_at'),
+      getAll('tf_os','id,legacy_id,os_number,client_name,reason,description,status,priority,archived,scheduled_at,started_at,completed_at,technician,notes,data,created_at,updated_at'),
+      getAll('tf_accesses','id,title,url,username,password,notes,data,created_at,updated_at'),
+      getAll('tf_messages','id,title,content,category,favorite,data,created_at,updated_at')
+    ]);
+    const norm=v=>{try{return JSON.stringify(v??null,Object.keys(v??{}).sort())}catch{return String(v)}};
+    const cMap=new Map(cc.map(x=>[String(x.legacy_id||''),x]));
+    const localC=clientRows(cc);
+    const cMissing=localC.filter(x=>!cMap.has(String(x.legacy_id||'')));
+    const cMismatch=localC.filter(x=>{const y=cMap.get(String(x.legacy_id||''));if(!y)return false;return norm({name:x.name,document:x.document,phone:x.phone,email:x.email,address:x.address,number:x.number,complement:x.complement,neighborhood:x.neighborhood,city:x.city,state:x.state,zip_code:x.zip_code,status:x.status,notes:x.notes,data:x.data})!==norm({name:y.name,document:y.document,phone:y.phone,email:y.email,address:y.address,number:y.number,complement:y.complement,neighborhood:y.neighborhood,city:y.city,state:y.state,zip_code:y.zip_code,status:y.status,notes:y.notes,data:y.data})});
+    results.clients={local:localC.length,cloud:cc.length,missing:cMissing.length,mismatch:cMismatch.length};
+
+    const oMap=new Map();oo.forEach(x=>{if(x.legacy_id)oMap.set('id:'+String(x.legacy_id),x);if(x.os_number)oMap.set('num:'+String(x.os_number),x)});
+    const localO=osRows(oo,new Map(cc.map(c=>[String(c.legacy_id||''),c])));
+    const oMissing=localO.filter(x=>!oMap.has('id:'+String(x.legacy_id))&&!oMap.has('num:'+String(x.os_number)));
+    const oMismatch=localO.filter(x=>{const y=oMap.get('id:'+String(x.legacy_id))||oMap.get('num:'+String(x.os_number));if(!y)return false;return norm({legacy_id:x.legacy_id,os_number:x.os_number,client_name:x.client_name,reason:x.reason,description:x.description,status:x.status,priority:x.priority,archived:x.archived,scheduled_at:x.scheduled_at,started_at:x.started_at,completed_at:x.completed_at,technician:x.technician,notes:x.notes,data:x.data})!==norm({legacy_id:y.legacy_id,os_number:y.os_number,client_name:y.client_name,reason:y.reason,description:y.description,status:y.status,priority:y.priority,archived:y.archived,scheduled_at:y.scheduled_at,started_at:y.started_at,completed_at:y.completed_at,technician:y.technician,notes:y.notes,data:y.data})});
+    results.os={local:localO.length,cloud:oo.length,missing:oMissing.length,mismatch:oMismatch.length};
+
+    const aMap=new Map(aa.map(x=>[String(x.data?.local_id||''),x]));
+    const localA=(window.accesses||[]).map(a=>({local_id:a.id,name:a.name||a.title||'',url:a.url||null,username:a.username||null,notes:a.description||a.notes||null}));
+    const aMissing=localA.filter(a=>!aMap.has(String(a.local_id)));
+    results.accesses={local:localA.length,cloud:aa.length,missing:aMissing.length};
+
+    const mMap=new Map(mm.map(x=>[String(x.data?.local_id||''),x]));
+    const localM=(window.customMessages||[]).map(m=>({local_id:m.id,title:m.title||'',content:m.text||m.content||''}));
+    const mMissing=localM.filter(m=>!mMap.has(String(m.local_id)));
+    results.messages={local:localM.length,cloud:mm.length,missing:mMissing.length};
+
+    results.conflicts=cMissing.length+cMismatch.length+oMissing.length+oMismatch.length+aMissing.length+mMissing.length;
+    results.verified=results.conflicts===0;
+    if(!results.verified)throw Object.assign(new Error('A verificação encontrou '+results.conflicts+' divergência(s). Nenhum dado foi apagado.'),{syncResults:results});
+    log('🔎 Verificação: ida + retorno conferidos.');
+    return results;
+  }
   async function syncSystem(){
     if(syncBusy)return; if(!client()||!uid()){toast('Entre no Supabase antes de sincronizar.');return;}
     syncBusy=true;cloudState.errors=[];const lines=[];const log=x=>{lines.push(x);renderSyncBox(lines.join('\n'));};
@@ -6479,6 +6525,15 @@ window.tfCloudLoad2029=tfCloudLoad2029;window.tfCloudMode2029=tfCloudMode2029;wi
   }
   function renderSyncBox(text){const el=document.getElementById('tfCloudSyncStatus');if(el)el.textContent=text;}
   function renderSyncPanel(){const last=cloudState.last||safeJSON('tf_cloud_last_sync_v2032',null);const auto=localStorage.getItem(AUTO_KEY)==='1';const text=last?('Última sincronização: '+new Date(last.at).toLocaleString('pt-BR')+'\n'+JSON.stringify(last.results,null,2)):'Ainda não sincronizado nesta versão.';const host=document.getElementById('tfCloudSyncPanel');if(host)host.innerHTML=`<div class="tfCloudSyncHero"><div class="tfCloudSyncCard"><div class="eyebrow">NÚCLEO NUVEM • V20.0.32</div><h3>☁️ Tele Fibras + TFOS + Divônico</h3><p>A nuvem passa a ser o armazenamento principal. O navegador mantém cópia local como cache/backup. A sincronização abaixo é segura: <b>não exclui registros da nuvem</b>.</p><div class="tfCloudSyncActions"><button class="btn primary" onclick="tfCloudSyncNow()" ${syncBusy?'disabled':''}>☁️ Sincronizar tudo agora</button><button class="btn" onclick="tfCloudToggleAuto()">${auto?'🟢 Sincronização automática: ON':'⚪ Sincronização automática: OFF'}</button></div><div id="tfCloudSyncStatus" class="tfCloudSyncStatus">${e(text)}</div></div><div class="tfCloudSyncCard"><h3>Camadas</h3><div class="tfCloudLayers"><div class="tfCloudLayer"><b>👥 Tele Fibras</b><span>Clientes • OS • Acessos • Mensagens • Arquivos</span></div><div class="tfCloudLayer"><b>🖥️ TFOS</b><span>Apps • estado • launcher • preferências • manifesto</span></div><div class="tfCloudLayer"><b>🧠 Divônico</b><span>Memória • conhecimento • contexto • chats • cofre</span></div></div><div style="margin-top:12px"><span class="tfCloudSyncBadge ${auto?'ok':'warn'}">${auto?'● automático ativo':'● manual até ativar'}</span></div></div></div>`;}
+  function renderTFX20Panel(){
+    const host=document.getElementById('tfCloudSyncPanel'); if(!host)return;
+    let box=document.getElementById('tfTfx20PanelStatus');
+    if(!box){box=document.createElement('div');box.id='tfTfx20PanelStatus';box.style.cssText='margin-top:12px;padding:10px 12px;border:1px solid rgba(0,0,0,.08);border-radius:12px;background:rgba(255,255,255,.55);font-size:12px;white-space:pre-line';host.appendChild(box);}
+    const last=safeJSON('tf_tfx_last_20s_sync',null);
+    box.textContent=last?('⚡ TFX automático • 20 segundos\nÚltimo ciclo: '+new Date(last.at).toLocaleString('pt-BR')+(last.results?.verified?'\n✅ ida + retorno verificados':'\n⚠️ verificação pendente/erro')):'⚡ TFX automático • 20 segundos\nAguardando o primeiro ciclo…';
+  }
+  const oldRenderSyncPanel=renderSyncPanel;
+  renderSyncPanel=function(){oldRenderSyncPanel();setTimeout(renderTFX20Panel,0);};
   const oldCloudPage=window.cloudPage;
   window.cloudPage=function(){if(typeof oldCloudPage==='function')oldCloudPage();setTimeout(()=>{const content=document.getElementById('content');if(!content)return;let panel=document.getElementById('tfCloudSyncPanel');if(!panel){panel=document.createElement('div');panel.id='tfCloudSyncPanel';panel.style.marginTop='16px';const page=content.querySelector('.tfCloudPage');if(page)page.appendChild(panel);}renderSyncPanel();},0);};
   window.tfCloudSyncNow=syncSystem;
@@ -6486,6 +6541,38 @@ window.tfCloudLoad2029=tfCloudLoad2029;window.tfCloudMode2029=tfCloudMode2029;wi
   window.tfCloudAutoSyncEnabled=()=>localStorage.getItem(AUTO_KEY)==='1';
   // Reenvia alterações locais com debounce somente quando o usuário ativar o modo automático.
   function queue(){if(!window.tfCloudAutoSyncEnabled()||!uid()||syncBusy)return;clearTimeout(syncTimer);syncTimer=setTimeout(()=>syncSystem(),1800);}
+  // V20.0.52 — TFX-only bidirectional verification every 20 seconds.
+  let tfx20Busy=false;
+  async function tfxSync20s(){
+    if(tfx20Busy||syncBusy||!client()||!uid())return;
+    tfx20Busy=true;
+    const started=Date.now();
+    try{
+      const lines=[]; const log=x=>{lines.push(x);tfxSync20Visual(lines.join('\n'),'sync');};
+      tfxSync20Visual('☁️ TFX: sincronização iniciada…','sync');
+      const results=await syncTFXOnly(log);
+      const at=now();
+      localStorage.setItem('tf_tfx_last_20s_sync',JSON.stringify({at,results,durationMs:Date.now()-started}));
+      tfxSync20Visual('✅ TFX sincronizado e verificado\n'+new Date(at).toLocaleTimeString('pt-BR')+' • ida + retorno OK','ok');
+    }catch(err){
+      const at=now(); const results=err?.syncResults||null;
+      localStorage.setItem('tf_tfx_last_20s_sync',JSON.stringify({at,results,error:err?.message||String(err),durationMs:Date.now()-started}));
+      tfxSync20Visual('⚠️ TFX: verificação não confirmou os dados\n'+(err?.message||String(err)),'warn');
+      console.warn('TFX sync 20s:',err);
+    }finally{tfx20Busy=false;}
+  }
+  function tfxSync20Visual(text,state){
+    let el=document.getElementById('tfTfx20SyncBadge');
+    if(!el){el=document.createElement('div');el.id='tfTfx20SyncBadge';el.style.cssText='position:fixed;right:16px;bottom:16px;z-index:2147483000;padding:8px 12px;border-radius:12px;font:600 12px/1.35 system-ui,sans-serif;background:rgba(255,255,255,.92);box-shadow:0 4px 18px rgba(0,0,0,.12);border:1px solid rgba(0,0,0,.08);backdrop-filter:blur(8px);max-width:360px;white-space:pre-line;pointer-events:none';document.body.appendChild(el);}
+    el.textContent=text;
+    el.style.borderColor=state==='ok'?'rgba(46,125,50,.35)':state==='warn'?'rgba(198,40,40,.35)':'rgba(90,90,90,.2)';
+    if(state==='ok'){clearTimeout(window.__tfTfx20Hide);window.__tfTfx20Hide=setTimeout(()=>{if(el)el.textContent='☁️ TFX • próximo ciclo em 20s';},4500);}
+  }
+  window.tfTfxSync20s=tfxSync20s;
+  if(!window.tfTfx20Timer){
+    window.tfTfx20Timer=setInterval(tfxSync20s,20000);
+    setTimeout(tfxSync20s,5000);
+  }
   window.tfCloudQueueSync=queue;
   ['saveOS','saveArchive','saveAccesses','saveCustomMessages','saveDivonico','saveDivonicoVault','saveCustomClients','saveDivonicoApps'].forEach(name=>{
     const fn=window[name]; if(typeof fn!=='function')return; window[name]=function(){const r=fn.apply(this,arguments);queue();return r;};
